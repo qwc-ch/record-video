@@ -1,0 +1,51 @@
+name: Screen Record Website
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: '要录制的网站 BASE_URL'
+        required: true
+        default: 'https://blog.amamo.top'
+      total_minutes:
+        description: '总时长（分钟）'
+        required: true
+        default: '10'
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Playwright
+        run: |
+          npm install playwright
+          npx playwright install chromium --with-deps
+
+      - name: Run record script
+        env:
+          SITE_BASE_URL: ${{ github.event.inputs.base_url }}
+          OUT_DIR: recordings
+          TOTAL_SECONDS: ${{ github.event.inputs.total_minutes }}
+        run: |
+          export TOTAL_SECONDS=$(( ${{ github.event.inputs.total_minutes }} * 60 ))
+          node record.mjs
+
+      - name: Convert webm to mp4
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          cd recordings
+          ffmpeg -i full.webm -c:v libx264 -preset fast -crf 23 full.mp4 -y
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-recording
+          path: recordings/full.mp4
