@@ -7,10 +7,6 @@ on:
         description: '要录制的网站 BASE_URL'
         required: true
         default: 'https://blog.amamo.top'
-      total_minutes:
-        description: '总时长（分钟）'
-        required: true
-        default: '10'
       fps:
         description: '录制帧率（x11grab 恒定帧率，建议 30，机器扛得住可 60）'
         required: true
@@ -46,7 +42,6 @@ jobs:
           Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
           export DISPLAY=:99
           sleep 2
-          export TOTAL_SECONDS=$(( ${{ github.event.inputs.total_minutes }} * 60 ))
           node record.mjs
 
       - name: Upload artifact

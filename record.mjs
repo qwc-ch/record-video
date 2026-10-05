@@ -13,20 +13,17 @@ const DISPLAY = process.env.DISPLAY || ":99";
 const WIDTH = Number(process.env.WIDTH || 1920);
 const HEIGHT = Number(process.env.HEIGHT || 1080);
 const FPS = Number(process.env.FPS || 30);
-const TOTAL_SECONDS = Number(process.env.TOTAL_SECONDS || 600);
 mkdirSync(OUT_DIR, { recursive: true });
 
-// 每个页面：路径、时长权重、是否留言页（需先点掉公告弹窗的叉）
+// 每个页面：路径、时长(秒)。用户要求每页约 1.5 分钟 = 90 秒
 const steps = [
-  { name: "home",      path: "/",           weight: 90 },
-  { name: "friends",   path: "/friends/",   weight: 60 },
-  { name: "timetable", path: "/timetable/", weight: 60 },
-  { name: "analytics", path: "/analytics/", weight: 60 },
-  { name: "circle",    path: "/circle/",    weight: 60 },
-  { name: "guestbook", path: "/guestbook/", weight: 90, closePopup: true },
+  { name: "home",      path: "/",           duration: 90 },
+  { name: "friends",   path: "/friends/",   duration: 90 },
+  { name: "timetable", path: "/timetable/", duration: 90 },
+  { name: "analytics", path: "/analytics/", duration: 90 },
+  { name: "circle",    path: "/circle/",    duration: 90 },
+  { name: "guestbook", path: "/guestbook/", duration: 90, closePopup: true },
 ];
-const weightSum = steps.reduce((s, p) => s + p.weight, 0);
-for (const p of steps) p.duration = Math.max(10, Math.round((p.weight / weightSum) * TOTAL_SECONDS));
 console.log("各页面录制时长(s):", steps.map(p => `${p.name}=${p.duration}`).join(", "));
 
 // 拦截 Live2D/WebGL 组件与统计脚本：省 CPU、渲染更快，录出来的滚动更流畅
@@ -73,15 +70,17 @@ await context.route("**/*", (route) => {
 const page = await context.newPage();
 
 // 在 durationMs 内从顶部匀速线性滚到页面最底部（rAF 驱动，保证划完全页且连续平滑）
+// 注意：必须用 behavior:"instant" 瞬时定位，避免站点 CSS 的 scroll-behavior:smooth
+// 与逐帧滚动叠加导致 Chrome 把滚动排队动画化，产生偶发抖动
 async function scrollFully(page, durationMs) {
-  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
   await page.waitForTimeout(600);
   await page.evaluate((ms) => new Promise((resolve) => {
     const start = performance.now();
     function frame(now) {
       const t = Math.min(1, (now - start) / ms);
       const max = document.documentElement.scrollHeight - window.innerHeight;
-      window.scrollTo(0, Math.max(0, max) * t);
+      window.scrollTo({ top: Math.max(0, max) * t, behavior: "instant" });
       if (t < 1) requestAnimationFrame(frame);
       else resolve();
     }
