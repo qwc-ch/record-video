@@ -1,104 +1,148 @@
-// 交互式录屏：按导航顺序在不同页面间跳转，每页缓慢滚动
+// 交互式录屏（恒定帧率版）：
+// 浏览器以有头模式跑在 Xvfb 虚拟屏幕里，用 ffmpeg x11grab 以固定帧率直接抓屏，
+// 输出就是恒定 FPS 的 mp4——不再经过 Playwright 低帧率、可变帧率的 webm 录屏。
+// Live2D / WebGL 组件、统计脚本等重渲染资源在网络层拦截，保证滚动流畅。
 import { chromium } from "playwright";
-import { mkdirSync, renameSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 const BASE_URL = process.env.SITE_BASE_URL || "https://blog.amamo.top";
 const OUT_DIR = process.env.OUT_DIR || "recordings";
+const DISPLAY = process.env.DISPLAY || ":99";
+const WIDTH = Number(process.env.WIDTH || 1920);
+const HEIGHT = Number(process.env.HEIGHT || 1080);
+const FPS = Number(process.env.FPS || 30);
+const TOTAL_SECONDS = Number(process.env.TOTAL_SECONDS || 600);
 mkdirSync(OUT_DIR, { recursive: true });
 
-const VIEWPORT = { width: 1920, height: 1080 };
-// 每个步骤停留时长(秒)，总时长按 TOTAL_SECONDS 缩放
+// 每个页面：路径、时长权重、是否留言页（需先点掉公告弹窗的叉）
 const steps = [
-  { name: "home",       path: "/",          weight: 90 },
-  { name: "friends",    path: "/friends/",  weight: 60 },
-  { name: "timetable",  path: "/timetable/",weight: 60 },
-  { name: "analytics",  path: "/analytics/",weight: 60 },
-  { name: "circle",     path: "/circle/",   weight: 60 },
-  { name: "guestbook",  path: "/guestbook/",weight: 90, closePopup: true },
+  { name: "home",      path: "/",           weight: 90 },
+  { name: "friends",   path: "/friends/",   weight: 60 },
+  { name: "timetable", path: "/timetable/", weight: 60 },
+  { name: "analytics", path: "/analytics/", weight: 60 },
+  { name: "circle",    path: "/circle/",    weight: 60 },
+  { name: "guestbook", path: "/guestbook/", weight: 90, closePopup: true },
 ];
-const TOTAL_SECONDS = Number(process.env.TOTAL_SECONDS || 600);
 const weightSum = steps.reduce((s, p) => s + p.weight, 0);
 for (const p of steps) p.duration = Math.max(10, Math.round((p.weight / weightSum) * TOTAL_SECONDS));
-console.log("各步骤时长(s):", steps.map(p => `${p.name}=${p.duration}`).join(", "));
+console.log("各页面录制时长(s):", steps.map(p => `${p.name}=${p.duration}`).join(", "));
 
+// 拦截 Live2D/WebGL 组件与统计脚本：省 CPU、渲染更快，录出来的滚动更流畅
+const BLOCK_RE = /live2d|l2dwidget|spline\.design|googletagmanager|google-analytics|googletag|umami|51\.la|clarity\.ms|cloudflareinsights/i;
+
+// ---------- ffmpeg x11grab 恒定帧率抓屏 ----------
+const ffmpeg = spawn("ffmpeg", [
+  "-y",
+  "-f", "x11grab",
+  "-framerate", String(FPS),
+  "-video_size", `${WIDTH}x${HEIGHT}`,
+  "-i", DISPLAY,
+  "-draw_mouse", "1",               // 画面里画出鼠标，点击跳转能看到光标
+  "-c:v", "libx264",
+  "-preset", "veryfast",
+  "-crf", "22",
+  "-pix_fmt", "yuv420p",
+  join(OUT_DIR, "full.mp4"),
+], { stdio: ["pipe", "ignore", "pipe"] });
+let errChunks = 0;
+ffmpeg.stderr.on("data", (d) => {
+  if (errChunks < 40) { process.stderr.write(d); errChunks++; }
+});
+await new Promise((r) => setTimeout(r, 800));
+if (ffmpeg.exitCode !== null) throw new Error("ffmpeg 启动失败，检查 Xvfb 是否已运行");
+console.log(`ffmpeg x11grab 已启动: ${DISPLAY} @ 恒定 ${FPS}fps ${WIDTH}x${HEIGHT}`);
+
+// ---------- 浏览器（有头模式，跑在 Xvfb 里） ----------
 const browser = await chromium.launch({
+  headless: false,
   args: [
-    "--use-gl=angle",
-    "--use-angle=swiftshader",
-    "--enable-unsafe-swiftshader",
-    "--ignore-gpu-blocklist",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--kiosk",                      // 无浏览器 UI，整屏都是页面
+    `--window-size=${WIDTH},${HEIGHT}`,
+    "--disable-gpu",
   ],
 });
-
-// 整个流程在一个 context 里录，形成一段完整视频
-const context = await browser.newContext({
-  viewport: VIEWPORT,
-  recordVideo: { dir: OUT_DIR, size: VIEWPORT },
+const context = await browser.newContext({ viewport: null }); // 跟随窗口（kiosk 全屏 1920x1080）
+await context.route("**/*", (route) => {
+  if (BLOCK_RE.test(route.request().url())) return route.abort();
+  return route.continue();
 });
 const page = await context.newPage();
 
-async function slowScroll(page, durationMs) {
-  const start = Date.now();
-  // 回到顶部，慢慢滚到底
-  await page.evaluate(() => window.scrollTo({ top: 0 }));
-  await page.waitForTimeout(500);
-  const totalH = await page.evaluate(() => document.body.scrollHeight);
-  const stepsCount = Math.ceil(totalH / 200);
-  const perStep = Math.max(150, Math.floor(durationMs / stepsCount / 1.5));
-  for (let y = 0; y < totalH; y += 200) {
-    await page.evaluate((yy) => window.scrollTo({ top: yy, behavior: "smooth" }), y);
-    await page.waitForTimeout(Math.min(perStep, 1200));
-    if (Date.now() - start >= durationMs) break;
+// 在 durationMs 内从顶部匀速线性滚到页面最底部（rAF 驱动，保证划完全页且连续平滑）
+async function scrollFully(page, durationMs) {
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(600);
+  await page.evaluate((ms) => new Promise((resolve) => {
+    const start = performance.now();
+    function frame(now) {
+      const t = Math.min(1, (now - start) / ms);
+      const max = document.documentElement.scrollHeight - window.innerHeight;
+      window.scrollTo(0, Math.max(0, max) * t);
+      if (t < 1) requestAnimationFrame(frame);
+      else resolve();
+    }
+    requestAnimationFrame(frame);
+  }), durationMs);
+  await page.waitForTimeout(800);
+}
+
+// 留言页：点掉公告弹窗的叉
+// 弹窗是 <dialog>，叉按钮是 .privacy-close；限定 dialog[open] 并取第一个，避免 strict 模式多元素冲突
+async function closeAnnouncementPopup(page) {
+  const closeBtn = page.locator("dialog[open] .privacy-close").first();
+  try {
+    await closeBtn.waitFor({ state: "visible", timeout: 15000 });
+    await closeBtn.click({ timeout: 5000, force: true });
+    await closeBtn.waitFor({ state: "hidden", timeout: 5000 }); // 确认弹窗真的关了
+    console.log("已点掉公告弹窗的叉");
+    await page.waitForTimeout(1000);
+  } catch (e) {
+    console.log("弹窗叉未点到(继续录制):", e.message);
   }
 }
 
 for (const step of steps) {
   console.log(`\n=== ${step.name} (${step.path}) ${step.duration}s ===`);
-  await page.goto(`${BASE_URL}${step.path}`, { waitUntil: "networkidle", timeout: 60000 });
-
-  if (step.closePopup) {
+  // 上一步如果已经点链接跳过来了，就不重复 goto
+  let current = "";
+  try { current = new URL(page.url()).pathname; } catch {}
+  if (current !== step.path) {
     try {
-      const closeBtn = page.locator(".privacy-close");
-      await closeBtn.waitFor({ state: "visible", timeout: 10000 });
-      await closeBtn.click();
-      console.log("已关闭公告弹窗");
-      await page.waitForTimeout(1000);
+      await page.goto(`${BASE_URL}${step.path}`, { waitUntil: "networkidle", timeout: 60000 });
     } catch (e) {
-      console.log("未检测到弹窗或关闭失败：", e.message);
+      console.log("goto 失败(继续):", e.message);
     }
   }
+  if (step.closePopup) await closeAnnouncementPopup(page);
+  await scrollFully(page, step.duration * 1000);
 
-  await slowScroll(page, step.duration * 1000);
-
-  // 演示"交互跳转"：在当前页内点击侧边栏里通往下一个页面的链接，
-  // 让视频里有真实的点击+跳转动作。最后跳到的页面会在下一轮 goto 兜底。
-  const idx = steps.indexOf(step);
-  const next = steps[idx + 1];
+  // 交互跳转：点侧边栏里通往下一个页面的链接，让视频里有真实的点击动作
+  const next = steps[steps.indexOf(step) + 1];
   if (next) {
     try {
       const link = page.locator(`a[href="${next.path}"]`).first();
-      if (await link.count() > 0) {
+      if (await link.count()) {
+        await link.scrollIntoViewIfNeeded().catch(() => {});
         await link.click({ timeout: 5000 });
-        await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-        console.log(`已通过点击跳转到 ${next.path}`);
+        await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
+        console.log(`已点击跳转 → ${next.path}`);
         await page.waitForTimeout(1500);
-        // 跳过去后稍微停一下，表现"看了一眼"
-        await page.waitForTimeout(Math.min(3000, next.duration * 200));
       }
     } catch (e) {
-      console.log(`点击跳转失败(忽略): ${e.message}`);
+      console.log(`点击跳转失败(下轮 goto 兜底): ${e.message}`);
     }
   }
 }
 
-const video = page.video();
-await context.close();
-if (video) {
-  const src = await video.path();
-  const dest = join(OUT_DIR, "full.webm");
-  renameSync(src, dest);
-  console.log(`\n已保存 ${dest}`);
-}
+// ---------- 收尾：关浏览器，优雅停 ffmpeg ----------
 await browser.close();
-console.log("录制完成");
+ffmpeg.stdin.write("q");
+await new Promise((resolve) => {
+  const timer = setTimeout(() => { ffmpeg.kill("SIGKILL"); resolve(); }, 8000);
+  ffmpeg.once("exit", () => { clearTimeout(timer); resolve(); });
+});
+console.log(`\n录制完成: ${join(OUT_DIR, "full.mp4")}`);

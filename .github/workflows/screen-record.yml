@@ -11,6 +11,10 @@ on:
         description: '总时长（分钟）'
         required: true
         default: '10'
+      fps:
+        description: '录制帧率（x11grab 恒定帧率，建议 30，机器扛得住可 60）'
+        required: true
+        default: '30'
 
 jobs:
   record:
@@ -29,20 +33,21 @@ jobs:
           npm install playwright
           npx playwright install chromium --with-deps
 
+      - name: Install ffmpeg and Xvfb
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg xvfb
+
       - name: Run record script
         env:
           SITE_BASE_URL: ${{ github.event.inputs.base_url }}
           OUT_DIR: recordings
-          TOTAL_SECONDS: ${{ github.event.inputs.total_minutes }}
+          FPS: ${{ github.event.inputs.fps }}
         run: |
+          # 起一个 1920x1080x24 的虚拟屏幕，浏览器有头跑在里面，ffmpeg 直接抓屏出 mp4
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+          export DISPLAY=:99
+          sleep 2
           export TOTAL_SECONDS=$(( ${{ github.event.inputs.total_minutes }} * 60 ))
           node record.mjs
-
-      - name: Convert webm to mp4
-        run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
-          cd recordings
-          ffmpeg -i full.webm -c:v libx264 -preset fast -crf 23 full.mp4 -y
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
